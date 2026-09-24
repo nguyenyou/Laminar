@@ -1,6 +1,8 @@
 package com.raquo.laminar.tests
 
 import com.raquo.laminar.api.L._
+import com.raquo.laminar.inserters.{CollectionCommand, Inserter}
+import com.raquo.laminar.inserters.CollectionCommand.{Append, ReplaceAll}
 import com.raquo.laminar.nodes.Slot
 import com.raquo.laminar.utils.UnitSpec
 
@@ -138,6 +140,138 @@ class SlotAttributeStealingSpec extends UnitSpec {
       tracker.assertNoEvents.clear()
       e.ref.getAttribute("slot") shouldBe "prefix"
       f.ref.getAttribute("slot") shouldBe "prefix"
+    }
+  }
+
+  it("a slotted-list reconcile re-asserts the Slot's slot over a manual override on a nested group's content") {
+    // Same as the above, but `e` sits inside a nested group, next to a plain item `f`.
+    // Every reconcile or move that touches the group is a fresh Slot write for its content,
+    // exactly like it is for `f`: whether the group stays in place, is reordered, or is moved
+    // to another list under the same element or a different one.
+    val tracker = createEventTracker()
+    val e = tracker.createSpan("E")
+    val f = tracker.createSpan("F")
+    tracker.clear()
+    val nested = children <-- Val(List(e))
+    val items1 = Var[List[Inserter]](List(nested, f))
+    val items2 = Var[List[Inserter]](Nil)
+    val items3 = Var[List[Inserter]](Nil)
+    val host = div(new Slot("prefix")(children <-- items1.signal, children <-- items2.signal))
+    val otherHost = div(new Slot("prefix")(children <-- items3.signal))
+
+    def overrideSlotManually(): Unit = {
+      e.amend(slot := "manual")
+      f.amend(slot := "manual")
+      e.ref.getAttribute("slot") shouldBe "manual"
+      f.ref.getAttribute("slot") shouldBe "manual"
+    }
+
+    withClue("both elements get the Slot's slot on mount:") {
+      mount(div(host, otherHost))
+      tracker
+        .assertEvents(
+          _.mounted("E"),
+          _.mounted("F")
+        )
+        .clear()
+      e.ref.getAttribute("slot") shouldBe "prefix"
+      f.ref.getAttribute("slot") shouldBe "prefix"
+    }
+
+    withClue("the list re-emits the same items in place:") {
+      overrideSlotManually()
+      items1.set(List(nested, f))
+      tracker.assertNoEvents.clear()
+      e.ref.getAttribute("slot") shouldBe "prefix"
+      f.ref.getAttribute("slot") shouldBe "prefix"
+    }
+
+    withClue("the list reorders its items:") {
+      overrideSlotManually()
+      items1.set(List(f, nested))
+      tracker.assertNoEvents.clear()
+      e.ref.getAttribute("slot") shouldBe "prefix"
+      f.ref.getAttribute("slot") shouldBe "prefix"
+    }
+
+    withClue("a sibling list under the same element steals the items:") {
+      overrideSlotManually()
+      items2.set(List(nested, f))
+      items1.set(Nil)
+      tracker.assertNoEvents.clear()
+      e.ref.getAttribute("slot") shouldBe "prefix"
+      f.ref.getAttribute("slot") shouldBe "prefix"
+    }
+
+    withClue("a list under a different element steals the items:") {
+      overrideSlotManually()
+      items3.set(List(nested, f))
+      items2.set(Nil)
+      tracker.assertNoEvents.clear()
+      e.ref.getAttribute("slot") shouldBe "prefix"
+      f.ref.getAttribute("slot") shouldBe "prefix"
+      expectNode(
+        otherHost.ref,
+        div.of(
+          sentinel,
+          sentinel, span.of("E", slot is "prefix"), sentinel, // nested: [e]
+          span.of("F", slot is "prefix"),
+          sentinel
+        )
+      )
+    }
+  }
+
+  List(true, false).foreach { minimizeDiff =>
+
+    it(s"a slotted `children.command` ReplaceAll(minimizeDiff = $minimizeDiff) re-asserts the Slot's slot over a manual override, even on a node that stays in place") {
+      // Same as the reorder above: ReplaceAll is a fresh Slot write for every node it's given,
+      // regardless of whether the node needs to move, and whether it's kept or re-inserted.
+      val tracker = createEventTracker()
+      val e = tracker.createSpan("E")
+      val f = tracker.createSpan("F")
+      tracker.clear()
+      val commandBus = new EventBus[CollectionCommand[HtmlElement]]
+      val host = div(new Slot("prefix")(children.command <-- commandBus.events))
+
+      withClue("both elements get the Slot's slot on mount:") {
+        mount(div(host))
+        commandBus.emit(Append(e))
+        commandBus.emit(Append(f))
+        tracker
+          .assertEvents(
+            _.mounted("E"),
+            _.mounted("F")
+          )
+          .clear()
+        e.ref.getAttribute("slot") shouldBe "prefix"
+        f.ref.getAttribute("slot") shouldBe "prefix"
+      }
+
+      withClue("a manual slot := overrides just that element:") {
+        e.amend(slot := "manual")
+        tracker.assertNoEvents.clear()
+        e.ref.getAttribute("slot") shouldBe "manual"
+        f.ref.getAttribute("slot") shouldBe "prefix"
+      }
+
+      withClue("ReplaceAll(e, f) re-asserts the Slot's slot on e, which stays in place:") {
+        commandBus.emit(ReplaceAll(e :: f :: Nil, minimizeDiff))
+        if (minimizeDiff) {
+          tracker.assertNoEvents.clear()
+        } else {
+          tracker
+            .assertEvents(
+              _.unmounted("E"),
+              _.unmounted("F"),
+              _.mounted("E"),
+              _.mounted("F")
+            )
+            .clear()
+        }
+        e.ref.getAttribute("slot") shouldBe "prefix"
+        f.ref.getAttribute("slot") shouldBe "prefix"
+      }
     }
   }
 

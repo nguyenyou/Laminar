@@ -14,7 +14,7 @@ import com.raquo.laminar.utils.UnitSpec
   * Sections, in order:
   *   1. Classic single-node `child <--` moves (pre-#157 path: ChildInserter.switchToChild).
   *   2. Classic `children <--` plain-element moves (pre-#157 reconcile: updateChildren).
-  *   3. A dynamic inserter reordered WITHIN one `children <--` list (moveWithinDynamicList).
+  *   3. A dynamic inserter reordered WITHIN one `children <--` list.
   *   4. A dynamic inserter moved BETWEEN two `children <--` lists (add-first steal / remove-first /
   *      the #163 two-bindings characterization), including nested and depth-2/3 spans.
   *   4b. Steal-BACK from a sibling (stale-re-emit re-steal), run against both same-parent and
@@ -23,6 +23,7 @@ import com.raquo.laminar.utils.UnitSpec
   *   4c. A moved span relocates exactly its LIVE DOM span (DOM order + departed nodes left behind).
   *   4d. Re-placing a torn-down group: with no live span to move, rebuild + re-mount, like re-adding
   *      a removed element.
+  *   4e. Un-nesting: a leaving nested item releases the nodes / inserters the list keeps.
   *   5. Promote / demote across static application and a list (static <-> list, static <-> static).
   *   6. The inserter-TYPE matrix: `children.command <--` and `text <--` as moved items.
   *   7. The degenerate same-transaction double-add.
@@ -36,7 +37,7 @@ class InserterMoveSpec extends UnitSpec {
   //    under two separate parent divs (`CrossParent`). This is the move-suite analog of
   //    `SlotStealingSpec.SiblingSlots` (minus the slots). The same-parent layout is the sharp one
   //    for steal-BACK: the two lists no longer differ by DOM `parentNode`, so a DynamicInserter
-  //    re-stolen from a sibling takes `moveWithinDynamicList`'s SAME-parent branch (a raw
+  //    re-stolen from a sibling takes `NestedGroup.moveTo`'s SAME-parent branch (a raw
   //    reposition, no `moveToParent`) rather than the cross-parent transfer. A steal choreography is
   //    written once and registered against both layouts. `expectRoot` wraps each list's content in
   //    that list's own leading + trailing sentinels, then composes the two per the layout.
@@ -661,7 +662,7 @@ class InserterMoveSpec extends UnitSpec {
 
   it("moving elements within / between classic `children <--` lists never re-mounts them") {
     // The classic reconcile (ChildrenInserter.updateChildren) routes reorders and steals
-    // through moveWithinDynamicList, so relocating a plain element must not tear its DOM
+    // through addToDynamicList, so relocating a plain element must not tear its DOM
     // span down and re-add it. We pin this via lifecycle events: reorders and an
     // add-first steal fire NOTHING, while a genuine removal DOES unmount — proving the
     // moves are real no-ops, not luck.
@@ -754,11 +755,11 @@ class InserterMoveSpec extends UnitSpec {
   }
 
   // ----------------------------------------------------------------------------------
-  // 3. Dynamic inserter reordered WITHIN one `children <--` list (moveWithinDynamicList)
+  // 3. Dynamic inserter reordered WITHIN one `children <--` list
   // ----------------------------------------------------------------------------------
 
   it("reordering never re-mounts items: static and dynamic inserters move without re-running") {
-    // A move (moveWithinDynamicList) must relocate an item's DOM span WITHOUT tearing it down
+    // A move must relocate an item's DOM span WITHOUT tearing it down
     // and re-adding it: the logical parent is unchanged, so hooks/subscriptions must not re-run.
     // We pin this via lifecycle events – zero mount/unmount for any moved item, covering BOTH the
     // DYNAMIC item's override (its content span) AND the STATIC items' base-class move (the pure
@@ -820,7 +821,7 @@ class InserterMoveSpec extends UnitSpec {
         .clear()
     }
 
-    withClue("swap the two static neighbours (pure static-inserter moves, base-class moveWithinDynamicList) – no re-mount:") {
+    withClue("swap the two static neighbours (pure static-inserter moves) – no re-mount:") {
       itemsVar.set(List(staticB, staticA, dyn))
       expectNode(div.of("H", sentinel, span of "B", span of "A", sentinel, span of "d1", sentinel, sentinel))
       observeCount shouldBe 2
@@ -829,7 +830,7 @@ class InserterMoveSpec extends UnitSpec {
   }
 
   it("multi-node dynamic span moves forward and backward, of varying length (no re-mount)") {
-    // Exercises DynamicInserter.moveWithinDynamicList directly: the whole nested span (leading
+    // Exercises NestedGroup.moveTo's same-parent branch: the whole nested span (leading
     // sentinel .. content nodes .. trailing sentinel) is relocated as a unit. Each move must relocate
     // the span WITHOUT re-mounting any of its content or the static neighbour it passes (asserted as
     // zero lifecycle events per move). We grow / shrink the span between moves so the internal walk
@@ -1440,7 +1441,7 @@ class InserterMoveSpec extends UnitSpec {
   // The stale-re-emit re-steal ("last write wins"), run against BOTH the same-parent and
   // cross-parent layouts via `TwoLists`. L2 steals the item add-first (L1's contentMap goes stale),
   // then L1 re-emits WITH the item and steals it back. For same-parent siblings this exercises
-  // `moveWithinDynamicList`'s same-parent branch: the two lists share the parent ELEMENT — hence the
+  // `NestedGroup.moveTo`'s same-parent branch: the two lists share the parent ELEMENT — hence the
   // same mount owner — so a raw reposition (without `moveToParent`'s owner transfer) is correct, and
   // the item's live subscription must survive the re-steal. Each choreography asserts the re-steal is
   // seamless (no re-mount / no re-render) and the item stays live at its home afterwards.
@@ -2077,7 +2078,7 @@ class InserterMoveSpec extends UnitSpec {
   // After another host STEALS a dynamic inserter and then GENUINELY removes it, the group is torn
   // down (`nestedGroupOpt` cleared). But the original list still tracks the inserter in its
   // `contentMap` (it never re-emitted), so its next re-emission of that inserter routes to
-  // `moveWithinDynamicList` (with nothing to move). This must NOT fail on the stale tracking — it
+  // `addToDynamicList` (with nothing to move). This must NOT fail on the stale tracking — it
   // must place the inserter afresh: re-insert + re-mount, exactly like re-adding a plain element
   // that had been removed. The list's item count already counted this inserter (it was in the
   // previous map), so a rebuild changes no count, while a genuinely new sibling still does.
@@ -2319,6 +2320,257 @@ class InserterMoveSpec extends UnitSpec {
           div.of("L2", sentinel, sentinel)
         )
       )
+    }
+  }
+
+  // ----------------------------------------------------------------------------------
+  // 4e. A leaving nested item releases the nodes that the same emission keeps (no re-mount)
+  // ----------------------------------------------------------------------------------
+
+  // When a list re-emits WITHOUT a nested dynamic item, but WITH a node (or a nested inserter)
+  // that currently lives inside that item, the node is un-nested seamlessly: the leaving item is
+  // torn down around it, and the node is re-parented into the list – like moving a plain element
+  // out of a wrapper that's being removed, within the same parent. This must hold regardless of
+  // where the kept node lands relative to the leaving item, and at any nesting depth.
+
+  List(
+    (
+      "after", // position
+      (a: Div, b: Div) => List(a, b), // nextItems
+      List[Rule](sentinel, div of "a", div of "b", sentinel) // expectedDom
+    ),
+    (
+      "before", // position
+      (a: Div, b: Div) => List(b, a), // nextItems
+      List[Rule](sentinel, div of "b", div of "a", sentinel) // expectedDom
+    )
+  ).foreach { case (position, nextItems, expectedDom) =>
+
+    it(s"un-nesting: (nested `child <-- b`, a) -> b $position a keeps b mounted, and the nested inserter is dead") {
+      val tracker = createEventTracker()
+      val a = tracker.createDiv("a")
+      val b = tracker.createDiv("b")
+      val c = tracker.createDiv("c")
+      tracker.clear()
+
+      val nestedVar = Var(b)
+      val items = Var[List[Inserter]](List(child <-- nestedVar.signal, a))
+
+      withClue("initial:") {
+        mount(div(children <-- items.signal))
+        expectNode(div.of(sentinel, sentinel, div of "b", sentinel, div of "a", sentinel))
+        tracker
+          .assertEvents(
+            _.mounted("b"),
+            _.mounted("a")
+          )
+          .clear()
+      }
+
+      withClue(s"the list drops the nested item, and places b directly, $position a:") {
+        items.set(nextItems(a, b))
+        expectNode(div.of(expectedDom: _*))
+        tracker.assertNoEvents.clear()
+      }
+
+      withClue("the old nested `child <--` was torn down, so it no longer renders anything:") {
+        nestedVar.set(c)
+        expectNode(div.of(expectedDom: _*))
+        tracker.assertNoEvents.clear()
+      }
+    }
+  }
+
+  it("un-nesting at depth 2: (nested `children <--` (c, nested `child <-- b`), a) -> (a, b) keeps b, unmounts c") {
+    val tracker = createEventTracker()
+    val a = tracker.createDiv("a")
+    val b = tracker.createDiv("b")
+    val c = tracker.createDiv("c")
+    tracker.clear()
+
+    val items = Var[List[Inserter]](List(children <-- Val(List[Inserter](c, child <-- Val(b))), a))
+
+    withClue("initial:") {
+      mount(div(children <-- items.signal))
+      expectNode(
+        div.of(
+          sentinel, // outer list
+          sentinel, // nested list
+          div of "c",
+          sentinel, div of "b", sentinel, // nested child
+          sentinel, // nested list trailing
+          div of "a",
+          sentinel // outer list trailing
+        )
+      )
+      tracker
+        .assertEvents(
+          _.mounted("c"),
+          _.mounted("b"),
+          _.mounted("a")
+        )
+        .clear()
+    }
+
+    withClue("both nested items are torn down around b, which stays mounted:") {
+      items.set(List(a, b))
+      expectNode(div.of(sentinel, div of "a", div of "b", sentinel))
+      tracker
+        .assertEvents(
+          _.unmounted("c")
+        )
+        .clear()
+    }
+  }
+
+  it("un-nesting a dynamic inserter: (nested `children <--` (c, nested `child <--` I), a) -> (a, I) keeps I live") {
+    // The kept thing can be a nested inserter too (matched by its identity, not its content).
+    // Its whole span is released from the leaving item, and it keeps rendering in its new place.
+    val tracker = createEventTracker()
+    val a = tracker.createDiv("a")
+    val b = tracker.createDiv("b")
+    val c = tracker.createDiv("c")
+    val d = tracker.createDiv("d")
+    tracker.clear()
+
+    val innerVar = Var(b)
+    val inner: Inserter = child <-- innerVar.signal
+    val items = Var[List[Inserter]](List(children <-- Val(List[Inserter](c, inner)), a))
+
+    withClue("initial:") {
+      mount(div(children <-- items.signal))
+      expectNode(
+        div.of(
+          sentinel, // outer list
+          sentinel, // nested list
+          div of "c",
+          sentinel, div of "b", sentinel, // I
+          sentinel, // nested list trailing
+          div of "a",
+          sentinel // outer list trailing
+        )
+      )
+      tracker
+        .assertEvents(
+          _.mounted("c"),
+          _.mounted("b"),
+          _.mounted("a")
+        )
+        .clear()
+    }
+
+    withClue("the nested list is torn down around I, which moves after a without re-mounting:") {
+      items.set(List(a, inner))
+      expectNode(div.of(sentinel, div of "a", sentinel, div of "b", sentinel, sentinel))
+      tracker
+        .assertEvents(
+          _.unmounted("c")
+        )
+        .clear()
+    }
+
+    withClue("I is still live in its new place:") {
+      innerVar.set(d)
+      expectNode(div.of(sentinel, div of "a", sentinel, div of "d", sentinel, sentinel))
+      tracker
+        .assertEvents(
+          _.unmounted("b"),
+          _.mounted("d")
+        )
+        .clear()
+    }
+  }
+
+  it("un-nesting several nodes out of several leaving items, reordered, unmounts only the dropped node") {
+    // c lands BEFORE its leaving item (a steal at the cursor), while b and d land AFTER a, so
+    // the list removes both leaving items before placing them (the early-removal path).
+    val tracker = createEventTracker()
+    val a = tracker.createDiv("a")
+    val b = tracker.createDiv("b")
+    val c = tracker.createDiv("c")
+    val d = tracker.createDiv("d")
+    val e = tracker.createDiv("e")
+    tracker.clear()
+
+    val items = Var[List[Inserter]](List(
+      children <-- Val(List(b, c, e)),
+      child <-- Val(d),
+      a
+    ))
+
+    withClue("initial:") {
+      mount(div(children <-- items.signal))
+      expectNode(
+        div.of(
+          sentinel, // outer list
+          sentinel, div of "b", div of "c", div of "e", sentinel, // nested list
+          sentinel, div of "d", sentinel, // nested child
+          div of "a",
+          sentinel // outer list trailing
+        )
+      )
+      tracker
+        .assertEvents(
+          _.mounted("b"),
+          _.mounted("c"),
+          _.mounted("e"),
+          _.mounted("d"),
+          _.mounted("a")
+        )
+        .clear()
+    }
+
+    withClue("(c, a, d, b): only e, which is dropped, unmounts:") {
+      items.set(List(c, a, d, b))
+      expectNode(div.of(sentinel, div of "c", div of "a", div of "d", div of "b", sentinel))
+      tracker
+        .assertEvents(
+          _.unmounted("e")
+        )
+        .clear()
+    }
+  }
+
+  // Similar to https://github.com/raquo/Laminar/issues/163
+  it("CHARACTERIZATION: re-wrapping a nested node into a NEW nested inserter re-mounts it when the old item leaves first") {
+    // (nested `child <-- b`, a) -> (a, NEW nested `child <-- b`): the list removes the leaving
+    // item before it reaches the new one, and at that point nothing is known about the new
+    // inserter's content – it's only rendered once the new item subscribes. So b is unmounted
+    // with the leaving item, then mounted again by the new one.
+    // #Note: known limitation – see "Known deviations" in notes/Inserters.md.
+    val tracker = createEventTracker()
+    val a = tracker.createDiv("a")
+    val b = tracker.createDiv("b")
+    tracker.clear()
+
+    val items = Var[List[Inserter]](List(child <-- Val(b), a))
+
+    withClue("initial:") {
+      mount(div(children <-- items.signal))
+      expectNode(div.of(sentinel, sentinel, div of "b", sentinel, div of "a", sentinel))
+      tracker
+        .assertEvents(
+          _.mounted("b"),
+          _.mounted("a")
+        )
+        .clear()
+    }
+
+    withClue("b is re-mounted:") {
+      items.set(List(a, child <-- Val(b)))
+      expectNode(div.of(sentinel, div of "a", sentinel, div of "b", sentinel, sentinel))
+      tracker
+        .assertEvents(
+          _.unmounted("b"),
+          _.mounted("b")
+        )
+        .clear()
+    }
+
+    withClue("reference: when the new inserter comes FIRST, it takes b before the old item leaves:") {
+      items.set(List(child <-- Val(b), a))
+      expectNode(div.of(sentinel, sentinel, div of "b", sentinel, div of "a", sentinel))
+      tracker.assertNoEvents.clear()
     }
   }
 

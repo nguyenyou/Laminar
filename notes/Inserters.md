@@ -24,7 +24,7 @@ Everything reachable through the `com.raquo.laminar.inserters` package: `child <
 
 ## 1. The north star: the plain-element analogy
 
-The single most important principle, cited throughout the code (e.g. `NestedGroup.moveToParent` scaladoc: _"mirroring how a plain element can be moved between two parents"_):
+The single most important principle, cited throughout the code (e.g. `NestedGroup.moveTo` scaladoc: _"mirroring how a plain element can be moved"_):
 
 > **A dynamic inserter should behave like a plain element wherever possible.**
 
@@ -32,14 +32,14 @@ A plain Laminar element (`val el = div(...)`) can be referenced by multiple pare
 
 Concretely, the analogy dictates:
 
-- **Identity is stable.** The same inserter `val` placed in a new location is _moved_, not rebuilt. (`DynamicInserter.apply` / `addToDynamicList` detect an already-placed group and call `moveToParent` instead of constructing.)
+- **Identity is stable.** The same inserter `val` placed in a new location is _moved_, not rebuilt. (`DynamicInserter.apply` / `addToDynamicList` detect an already-placed group and call `NestedGroup.moveTo` instead of constructing.)
 - **A move carries current content, and only current content.** Moving a `div` relocates the children it currently has — it does not reclaim children that were previously removed or stolen from it. Moving a group relocates exactly the nodes currently in its span. See §5.
 - **A seamless move does not re-mount.** When an element/group always has an active parent throughout the transition, its subscriptions/owner are _transferred_, not torn down and rebuilt, so no unmount/mount fires. See §6.
 - **Last write wins for a contested node.** If two hosts both want the same node, whichever acts last owns it — exactly as re-parenting a plain element to B removes it from A. See §4.
 
 Two operations must not be conflated (they answer different questions):
 
-1. **Moving a group** (`moveToParent`) — triggered by a re-emission whose payload _is_ the group (a list re-emitting `[G]`, or `G` applied to an element). It relocates the group's span. It says nothing about the group's _inner_ membership.
+1. **Moving a group** (`moveTo`) — triggered by a re-emission whose payload _is_ the group (a list re-emitting `[G]`, or `G` applied to an element). It relocates the group's span. It says nothing about the group's _inner_ membership.
 2. **Stealing / re-stealing a node** — governed by whichever list re-emits _that node_; last write wins.
 
 Blurring these is a recurring source of bugs (see §5).
@@ -78,7 +78,7 @@ Therefore any operation that must act on the _current_ span (relocate it, re-slo
 The two correct DOM-walk helpers are `InsertContext.removeContentMapNodesFromDom` (the destructive walk) and `currentContentInsertersFromDom` (its read-only twin). Any code that iterates `contentMap.forEach` to touch _live_ content is suspect (see §11).
 
 ### NestedGroup
-The rendering vehicle for a `DynamicInserter` — used both when it is applied plainly and when it is a `children <--` item, to keep one consistent code path (state + subscription management in one place, and moveability between arbitrary contexts). It owns the leading sentinel, the `InsertContext`, a `DynamicOwner` + `TransferableSubscription` pair (the "pilot" that mounts/unmounts the inner inserter with the group), and implements `moveToParent` / `removeFromParent`.
+The rendering vehicle for a `DynamicInserter` — used both when it is applied plainly and when it is a `children <--` item, to keep one consistent code path (state + subscription management in one place, and moveability between arbitrary contexts). It owns the leading sentinel, the `InsertContext`, a `DynamicOwner` + `TransferableSubscription` pair (the "pilot" that mounts/unmounts the inner inserter with the group), and implements `moveTo` / `removeFromParent`.
 
 ### Stealing
 When node/group X is tracked by inserter A but gets placed by inserter B, we say B _stole_ X from A. Steals happen because the observables feeding A and B propagate in some order, and the add (into B) can be processed before the remove (from A). Laminar's contract: **inserter code must never fail on the resulting stale state, and must self-correct on the next emission** (`InsertContext` scaladoc, lines 31–51). `removeFromDynamicList` is a no-op on parent mismatch precisely so a stale removal after a steal does nothing (`DynamicInserter.removeFromDynamicList`, `DomApi.removeChild` no-op on parent mismatch).
@@ -95,6 +95,15 @@ An item that leaves the list is removed from the DOM and its per-item lifecycle 
 
 ### Remove (no-op after a steal)
 If the node/group is no longer under this parent (already stolen), `removeFromDynamicList` does nothing — the new host owns it now. This is the "last write wins" safety valve.
+
+### Remove, keeping nested content (un-nesting)
+Removing old content can leave specific items in place: `removeContentMapNodesFromDom` takes a `keepItem` predicate, and passes it down through `removeFromDynamicList` → `NestedGroup.removeFromParent` into every nested item it tears down. The predicate is called with each item's `stableFirstNode` – its identity, the same key as in `contentMap` – not with an inserter object, because the same item can be represented by different inserter objects over time (e.g. fresh `SlottableChildInserter` wrappers on every emission). A kept item – a plain node, or a nested dynamic inserter with its whole span and live subscription – stays in the parent's DOM where it was, while the nested group around it is torn down. It never loses its parent, so it is not unmounted. Like moving a plain element out of a wrapper that's being removed, within the same parent.
+
+The caller must then promptly place every kept item where it belongs – otherwise it would be left in the DOM, untracked. Callers:
+
+- `child <--` taking over a span that contains its new node, even nested (§7).
+- `children <--` reconciliation removing a leaving item that contains nodes / inserters that the same emission keeps (`InserterMoveSpec` §4e).
+- `children.command <--` `ReplaceAll(newNodes, minimizeDiff = true)`, keeping the nodes that stay in the list. It also leaves kept nodes that are already in the right place untouched in the DOM. With `minimizeDiff = false`, `ReplaceAll` skips this work for performance: it removes all current nodes, then appends `newNodes`, re-mounting any overlap.
 
 ### External mutation
 Laminar tolerates a user/third-party removing an inserter's node from the DOM directly: the next reconciliation walks the live span and simply doesn't find it, correcting the count (`InserterExternalMutationSpec`; `ChildrenInserter.updateChildren` count-correction, referencing issue #120). External _insertion_ into a bracketed span (between our sentinels) is reported as an error on teardown/removeAll paths (`removeContentMapNodesFromDom` with a trailing sentinel), because we can't tell an intruder from our own content otherwise. External insertion into an unbracketed (`child <--`) span is silently treated as "the next sibling after our span" — we stop the walk there.
@@ -119,10 +128,16 @@ Last-write-wins must survive a group **move**: relocating a group leaves a sibli
 
 Four distinct relocation scenarios, all of which should be **seamless (no re-mount)** because the moved thing always has an active parent throughout:
 
-1. **Reorder within one list** — `moveWithinDynamicList`, same-parent branch: a raw DOM reposition of the span, then a slot re-affirm. No owner transfer needed.
-2. **Transfer between two lists** (add-first steal) — `addToDynamicList` sees an already-placed group and calls `moveToParent`: relocate the span, transfer the pilot subscription to the new parent's owner, update `currentParentNode` + `currentSlotName` so future emissions target the new home.
-3. **Promote** a plainly-applied dynamic inserter INTO a `children <--` list, and **demote** a list item back onto a plain element (`element.amend(inserter)`) — both routed through `moveToParent` / `apply`. Seamless. The trailing sentinel is added on promote and stickily retained on demote (§2).
-4. **Steal-back / re-steal** — a group stolen into a sibling, then re-emitted by its original list. Same-parent layout takes `moveWithinDynamicList`'s raw-reposition branch; cross-parent takes `moveToParent`.
+1. **Reorder within one list**.
+2. **Transfer between two lists** (add-first steal) — `addToDynamicList` sees an already-placed group.
+3. **Promote** a plainly-applied dynamic inserter INTO a `children <--` list, and **demote** a list item back onto a plain element (`element.amend(inserter)`, via `apply`). The trailing sentinel is added on promote and stickily retained on demote (§2).
+4. **Steal-back / re-steal** — a group stolen into a sibling (or applied plainly to the list's parent), then re-emitted by its original list.
+
+In all four, the list (or `apply`) calls `addToDynamicList` / `apply` on an already-placed inserter, just like it would to add a new one – the same way `setParent` both adds and moves a plain element. For a dynamic inserter, all four go through one entry point, `NestedGroup.moveTo`, so that the group always ends up in the same shape and lifecycle order as if it was created at its new place, regardless of how it was placed before:
+
+- **Shape first.** If the destination is a `children <--` list, `moveTo` ensures the trailing sentinel before moving. Without it, the list would treat the group's content as its own neighbouring items, and the group would treat the list's next items as its own content (`NestedGroupReStealSpec`).
+- **Same parent element** → a raw DOM reposition of the span, then a slot re-affirm on its live content (§9). The group and its content keep their Laminar parent and dynamic owner, so there is no lifecycle to update.
+- **Different parent element** → `moveToParent`: transfer the pilot subscription, relocate the span, update `currentParentNode` + `currentSlotName` so future emissions target the new home.
 
 ### The governing rule for `moveToParent`
 
@@ -132,13 +147,24 @@ This follows directly from the plain-element analogy: a moved `div` takes the ch
 
 - **DOM order, not map order.** `children.command <--` builds its DOM out of insertion order, so the map lists nodes differently than the DOM. The move must preserve DOM order (`InserterMoveSpec` "a stolen `children.command <--` span preserves its DOM order").
 - **Live membership, not map membership.** A node stolen out of the span by a sibling, or absorbed into the group's own nested `child <--`, has a stale map entry that the move must NOT drag back (the ④/⑤ bug class).
-- **Nested spans move as a unit.** The DOM walk jumps by each inserter's `lastNode.nextSibling`, so an inner group (with its own sentinels) is stepped over whole and relocated by its own recursive `moveToParent` (handles depth-2/3, ⑤).
+- **Nested spans move as a unit.** The DOM walk jumps by each inserter's `lastNode.nextSibling`, so an inner group (with its own sentinels) is stepped over whole and relocated by its own recursive `moveTo` (handles depth-2/3, ⑤).
 
-Accordingly, `moveToParent` **snapshots the live span (via `currentContentInsertersFromDom`) BEFORE moving the sentinels** (the walk starts at the leading sentinel, which is about to move), then re-adds each collected inserter in DOM order, then commits the new parent/slot, then transfers the subscription. The move deliberately does **not** touch `contentMap` — stale inner tracking is tolerated and self-corrects on the inner inserter's next emission, matching existing behaviour.
+Accordingly, `moveToParent` **snapshots the live span (via `currentContentInsertersFromDom`) BEFORE moving the sentinels** (the walk starts at the leading sentinel, which is about to move), then re-adds each collected inserter in DOM order, then commits the new parent/slot. The move deliberately does **not** touch `contentMap` — stale inner tracking is tolerated and self-corrects on the inner inserter's next emission, matching existing behaviour.
+
+### Lifecycle first: the pilot transfer precedes the content
+
+A group has no element of its own: its content's pilot subscriptions are owned directly by the parent element's `DynamicOwner`, alongside the group's own pilot. The group's logical ownership of its content is encoded only by **registration order** in that shared owner: the group's pilot must come first, so that on activation, the inner inserter updates its content _before_ that content mounts. This is what a plain `div(child <-- signal.map(render))` gets for free, and what a never-moved group gets by construction (its content only arrives once it activates).
+
+So `moveToParent` transfers the pilot subscription **before** snapshotting and moving the content:
+
+- **Inactive → active** (e.g. stolen out of an unmounted host into a mounted list): the inner inserter re-renders while still in the old, inactive parent, so stale content is dropped without ever mounting, and only fresh content is moved (and mounted). This matters beyond wasted events: stale content that mounts runs its own bindings, which can steal nodes from unrelated live lists and take them down with it when it's dropped (`NestedGroupActivationOrderSpec`).
+- **Active → inactive**: the inner inserter stops before its content unmounts, mirroring `removeFromParent`.
+- **Active → active**: a live transfer, seamless as before.
+- **Any move**: the group's pilot re-registers in the new owner ahead of its content's, so later unmount / remount cycles of the new host behave like a never-moved group. This recurses: a nested group is moved by its own `moveTo`, after its outer group has already re-rendered and dropped it if it was stale.
 
 ### Re-placing an inserter whose group was already torn down
 
-If the previous host genuinely _removed_ the group (set `nestedGroupOpt = js.undefined`) and then the original list re-emits it, there is no group to move — it must be **placed afresh** (re-inserted + re-mounted), like a plain element that was removed and re-added. `DynamicInserter.moveWithinDynamicList` detects the missing group and falls back to `addToDynamicList`; the list's item count already counted this inserter (it was in the previous map), so the rebuild changes no count. This is the counterpart to "move the live span": when there is no live span, rebuild. Covered by `InserterMoveSpec` section 4d.
+If the previous host genuinely _removed_ the group (set `nestedGroupOpt = js.undefined`) and then the original list re-emits it, there is no group to move — it must be **placed afresh** (re-inserted + re-mounted), like a plain element that was removed and re-added. `addToDynamicList` builds a new group when there is none; the list's item count already counted this inserter (it was in the previous map), so the rebuild changes no count. This is the counterpart to "move the live span": when there is no live span, rebuild. Covered by `InserterMoveSpec` section 4d.
 
 ---
 
@@ -149,7 +175,8 @@ If the previous host genuinely _removed_ the group (set `nestedGroupOpt = js.und
 - **Per-item lifecycle is preserved across a transfer** — the owner is transferred, not rebuilt, so per-item `onMount`/`onUnmount` and internal subscriptions stay live (`InserterMoveSpec` "add-first / steal keeps the item's per-item lifecycle intact").
 - **Ordering is empirical but pinned.** Some teardown/swap orders are not obvious and are deliberately encoded by tests (see `notes/Testing.md`):
   - `child <--` self-replace swaps **unmount-old-then-mount-new**.
-  - A takeover of a _foreign_ span mounts-new-then-unmounts-old.
+  - A `child <--` takeover of a _foreign_ span also unmounts the old content before mounting the new node. The node it keeps (§7) is neither unmounted nor re-mounted.
+  - `children.command <--` `ReplaceAll` unmounts the leaving nodes before mounting the new ones. With `minimizeDiff = false`, all old nodes are considered "leaving", including those that are then re-inserted.
   - `children <--` teardown walks `contentMap` in **insertion order**, not current DOM order (several `#Note` comments; e.g. `InserterMoveSpec:890`, `InserterExternalMutationSpec:148`). This is teardown only — relocation uses DOM order (§5).
   - `Replace` (command) unmounts the old node then mounts the new (`InserterMoveSpec:1718`).
 
@@ -166,7 +193,7 @@ If the previous host genuinely _removed_ the group (set `nestedGroupOpt = js.und
 - Switching TO `child <--` / `text <--` clears prior multi-node content down to (at most) the one node being kept, and drops the trailing sentinel.
 - Switching TO `children.command <--` clears any content left by a _non-command_ inserter (commands can't patch foreign content to a target state), but **preserves** content it built itself across a mere remount, and preserves content built by a _different_ command inserter (`InserterTakeoverSpec` "children.command → children.command (different inserter) keeps the previous content").
 - A takeover that tears down a span reports an externally-inserted intruder (§3).
-- A takeover does **not** blindly tear down everything: `children <--` (a,b) → `child <-- b` keeps b mounted and unmounts only a (`InserterTakeoverSpec`).
+- A takeover does **not** blindly tear down everything: `children <--` (a,b) → `child <-- b` keeps b mounted and unmounts only a (`InserterTakeoverSpec`). This holds even if b is nested inside one of the list's dynamic items, at any depth: those items are torn down around b (§3 "un-nesting").
 
 ### The `setNextInserterType` invariant
 Whenever there is no trailing sentinel, `contentMap` holds **at most one** node. The guard in `setNextInserterType` throws if we ever switch to a trailing-sentinel type while lacking a trailing sentinel but already holding >1 content node (we wouldn't know where the pre-existing content ends). This is structurally unreachable via the public API; `InserterInvariantSpec` pins both the near-miss safety and the white-box guard firing.
@@ -220,15 +247,18 @@ Distinct from the last-write-wins contest above: when a slot could come from an 
 ### Persistence and live-span re-slotting
 
 - A dynamic inserter's slot is **persistent**, not just applied to current content: it is stored on the context (`currentSlotName`) so future emissions are slotted the same way. A `NestedGroup` move resolves the destination list's slot against its own and stores the result, redirecting the inner inserter's future emissions.
-- Re-slotting on a move/diff reads the **live DOM span**, never `contentMap` — so a node that has left the span is never re-slotted out from under its new host. `NestedGroup.applySlot` iterates `currentContentInsertersFromDom` and skips departed nodes; `updateChildren`'s same-place branch also re-affirms slot, because a different wrapper may now slot the same node. Covered by `SlotSpec` "re-slotting a moved group re-slots only its live span, leaving a sibling-stolen node's slot with its new host" (a re-steal between two sibling `Slot`s hits `NestedGroup.applySlot` via `moveWithinDynamicList`'s same-parent branch).
+- Re-slotting on a move/diff reads the **live DOM span**, never `contentMap` — so a node that has left the span is never re-slotted out from under its new host. `NestedGroup.applySlot` iterates `currentContentInsertersFromDom` and skips departed nodes; `updateChildren`'s same-place branch also re-affirms slot, because a different wrapper may now slot the same node. Covered by `SlotSpec` "re-slotting a moved group re-slots only its live span, leaving a sibling-stolen node's slot with its new host" (a re-steal between two sibling `Slot`s hits `NestedGroup.applySlot` via `NestedGroup.moveTo`'s same-parent branch).
+- **A group's content is re-affirmed like a plain item.** Whenever a list places, re-places, or reconciles in place a dynamic inserter item (and whenever such a group is moved, within or across parents), `NestedGroup.applySlot` re-affirms the effective slot on every node of the group's live span, even if the slot name didn't change. So the last-write-wins contest above behaves the same whether an element is a direct list item or sits inside a nested group, and regardless of which move path was taken. There is deliberately no "slot name unchanged" shortcut: it would let a manual `slot :=` on a group's content survive a reconcile that restores it on a plain sibling. Protecting stolen nodes is the live-span walk's job, not the shortcut's. Pinned by `SlotAttributeStealingSpec` "a slotted-list reconcile re-asserts the Slot's slot over a manual override on a nested group's content".
 
 ---
 
 ## 10. Known deviations from the ideal
 
-### Provably unachievable (not bugs we can fix)
+### Accepted limitations
 
 - **Issue #163 — moving an element between two sibling `child <--` bindings re-mounts in one direction only.** When one element is shown via one of two independent `child <--` bindings toggled by a single signal, whether the toggle re-mounts is _order-dependent_: the binding that GAINS the element must fire before the one that LOSES it for the transfer to be seamless. When the losing binding fires first, the element is detached to `None` (unmount) before re-attachment (mount). This is inherent to synchronous propagation order; a `delaySync` workaround only fixes one direction. Characterized (not "fixed") in `InserterMoveSpec` "CHARACTERIZATION (issue #163)". The `probe(addFirst=false)` remove-first re-mount in the REFERENCE test is the same underlying limitation.
+
+- **Re-wrapping a nested node into a NEW nested inserter can re-mount it.** `children <--` (nested `child <-- b`, a) → (a, NEW nested `child <-- b`): reconciliation removes the leaving item before it reaches the new one, and nothing is known about the new inserter's content until it subscribes, so b can't be kept (§3 "un-nesting"), and is unmounted, then mounted again. If the new inserter comes BEFORE the leaving item in the list, it takes b before the old item is removed, which is seamless. Fixing the general case would require deferring the teardown of leaving items until the end of reconciliation. Characterized in `InserterMoveSpec` "CHARACTERIZATION: re-wrapping a nested node…".
 
 ---
 
